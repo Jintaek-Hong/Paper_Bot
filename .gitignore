@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+/tmp/
+evaluated_papers.txt
