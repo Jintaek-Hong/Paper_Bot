@@ -1,8 +1,11 @@
 name: Daily Paper Bot
 on:
+  push:
+    branches:
+      - main
   schedule:
-    # 한국시간 아침 9시 (00:00 UTC)
-    - cron: '0 0 * * *'
+    # 한국시간 아침 9시 20분 (00:20 UTC) - 부하 분산을 위해 20분으로 조정
+    - cron: '20 0 * * *'
   workflow_dispatch: # Actions 탭에서 수동 시작 허용
 
 permissions:
