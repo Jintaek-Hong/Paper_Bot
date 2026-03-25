@@ -50,6 +50,8 @@ USER_INTERESTS = [
 # ==========================================
 # ⚙️ 4. AI 및 노션 세팅
 # ==========================================
+# 모델명은 안정적인 서비스를 위해 gemini-1.5-flash를 기본으로 사용합니다.
+MODEL_NAME = "gemini-1.5-flash"
 client = genai.Client(api_key=GEMINI_API_KEY)
 notion = Client(auth=NOTION_TOKEN)
 
@@ -64,30 +66,24 @@ def run_paper_bot():
         evaluated_links = set()
 
     five_years_ago = datetime.now() - timedelta(days=365*5)
-    global_relevant_entries = []
-
-    # 1단계: 모든 피드를 돌며 1차 필터링된 논문들을 모두 모음
+    
+    # 1단계: 모든 피드를 돌며 새 논문 후보들을 먼저 수집합니다.
+    all_candidates = []
+    print("📡 모든 RSS 피드에서 새로운 논문을 수집하고 있습니다...")
+    
     for url in RSS_URLS:
-        print(f"📡 접속 중: {url}")
         try:
             feed = feedparser.parse(url)
         except Exception as e:
             print(f"⚠️ RSS 파싱 에러 발생 ({url}): {e}")
             continue
 
-        candidates = []
-
-        # 날짜와 중복 조건을 만족하는 논문 후보를 추립니다 (API 비용/시간 절약을 위해 최대 15개)
         for entry in feed.entries:
-            if len(candidates) >= 15:
-                break
-                
             link = entry.link
-            # 이미 평가한 논문인지 확인
             if link in evaluated_links:
                 continue
 
-            # 최근 5년 이내 논문인지 날짜 확인
+            # 날짜 확인
             published_time = None
             if hasattr(entry, 'published_parsed') and entry.published_parsed:
                 published_time = datetime(*entry.published_parsed[:6])
@@ -95,71 +91,80 @@ def run_paper_bot():
                 published_time = datetime(*entry.updated_parsed[:6])
             
             if published_time and published_time < five_years_ago:
-                continue # 5년이 넘은 논문은 패스
+                continue
 
-            candidates.append(entry)
+            all_candidates.append(entry)
+            # 너무 많은 후보가 쌓이는 것을 방지 (최대 100개)
+            if len(all_candidates) >= 100:
+                break
+        
+        if len(all_candidates) >= 100:
+            break
 
-        # 후보가 있다면 AI에게 일괄로 의미적 연관성을 물어봅니다 (Semantic Filtering)
-        if candidates:
-            print(f"   🔍 검토할 새 논문 후보 {len(candidates)}개 발견. AI로 문맥 연관성 필터링 중...")
-            
-            prompt_lines = [
-                f"내 연구 관심사: {', '.join(USER_INTERESTS)}",
-                "아래는 최근 논문들의 제목과 초록입니다. 내 관심사와 '의미상' 관련된 논문들의 번호를 모두 찾아주세요.",
-                "단순 키워 일치가 아니더라도 문맥상, 학술적으로 밀접한 관련이 있다면 포함하세요.",
-                "답변은 반드시 연관된 논문의 번호만 쉼표로 구분해서 적어주세요. (예: 0, 2, 5) 연관된 논문이 하나도 없다면 '없음'이라고 적어주세요.\n",
-                "후보 논문 목록:"
-            ]
-            
-            for i, c in enumerate(candidates):
-                c_title = c.title
-                # 초록이 너무 길면 자릅니다
-                c_abs = c.description[:600] + "..." if hasattr(c, 'description') and c.description else "초록 없음"
-                prompt_lines.append(f"[{i}] 제목: {c_title}\n초록: {c_abs}\n")
-                
-            batch_prompt = "\n".join(prompt_lines)
-            
-            try:
-                # 1차 필터링 호출 - 429 에러 방지를 위해 재시도 로직 추가
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        filter_response = client.models.generate_content(
-                            model='gemini-2.5-flash',
-                            contents=batch_prompt
-                        )
-                        time.sleep(15) # API Rate Limit(분당 5회) 완벽 보호를 위해 대기시간 15초로 대폭 증가
-                        
-                        resp_text = filter_response.text.strip()
-                        if "없음" not in resp_text:
-                            # 응답에서 숫자(인덱스)만 정규식으로 추출
-                            indices = [int(num) for num in re.findall(r'\d+', resp_text)]
-                            
-                            # 중복 제거 및 유효한 인덱스만 걸러냄
-                            for idx in sorted(list(set(indices))):
-                                if 0 <= idx < len(candidates):
-                                    global_relevant_entries.append(candidates[idx])
-                        break # 성공시 반복문 탈출
-                        
-                    except Exception as api_err:
-                        if "429" in str(api_err):
-                            print(f"   [디버깅용 원본 에러 출력]: {api_err}")
-                            print(f"   ⏳ API 분당 한도 초과(429). 65초 대기 후 재시도합니다... ({attempt+1}/{max_retries})")
-                            time.sleep(65)
-                        else:
-                            print(f"   ⚠️ AI 필터링 중 에러 발생: {api_err}")
-                            break # 429가 아닌 다른 에러면 포기
-                                
-            except Exception as e:
-                print(f"   ⚠️ 알 수 없는 에러 발생: {e}")
-
-    if not global_relevant_entries:
-        print("\n⚠️ 전체 저널에서 새롭게 발견된 연관 논문이 없습니다. 봇을 종료합니다.")
+    if not all_candidates:
+        print("\n⚠️ 새롭게 발견된 논문이 없습니다. 봇을 종료합니다.")
         return
 
-    # 2단계: 걸러진 논문들에 대해 상세 평가 및 점수 매기기 진행
+    print(f"🔍 총 {len(all_candidates)}개의 새 논문 후보를 발견했습니다. AI로 1차 필터링을 시작합니다.")
+
+    # 2단계: 수집된 후보들을 30개씩 묶어서 일괄 필터링 (API 호출 횟수 절약)
+    global_relevant_entries = []
+    batch_size = 30
+    
+    for i in range(0, len(all_candidates), batch_size):
+        batch = all_candidates[i:i+batch_size]
+        print(f"   📦 배치 처리 중 ({i+1}~{min(i+batch_size, len(all_candidates))}/{len(all_candidates)})...")
+        
+        prompt_lines = [
+            f"내 연구 관심사: {', '.join(USER_INTERESTS)}",
+            "아래는 최근 논문들의 제목과 초록입니다. 내 관심사와 '의미상' 관련된 논문들의 번호를 모두 찾아주세요.",
+            "답변은 반드시 연관된 논문의 번호만 쉼표로 구분해서 적어주세요. (예: 0, 2, 5) 연관된 논문이 하나도 없다면 '없음'이라고 적어주세요.\n",
+            "후보 논문 목록:"
+        ]
+        
+        for idx, c in enumerate(batch):
+            c_title = c.title
+            c_abs = c.description[:600] + "..." if hasattr(c, 'description') and c.description else "초록 없음"
+            prompt_lines.append(f"[{idx}] 제목: {c_title}\n초록: {c_abs}\n")
+            
+        batch_prompt = "\n".join(prompt_lines)
+        
+        # 1차 필터링 호출
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                filter_response = client.models.generate_content(
+                    model=MODEL_NAME,
+                    contents=batch_prompt
+                )
+                time.sleep(20) # RPM 준수를 위한 대기 (1분당 3회 수준)
+                
+                resp_text = filter_response.text.strip()
+                if "없음" not in resp_text:
+                    indices = [int(num) for num in re.findall(r'\d+', resp_text)]
+                    for idx in sorted(list(set(indices))):
+                        if 0 <= idx < len(batch):
+                            global_relevant_entries.append(batch[idx])
+                break
+            except Exception as api_err:
+                if "429" in str(api_err):
+                    print(f"   ⏳ API 한도 초과(429). 70초 대기 후 재시도합니다... ({attempt+1}/{max_retries})")
+                    time.sleep(70)
+                else:
+                    print(f"   ⚠️ AI 필터링 중 에러 발생: {api_err}")
+                    break
+
+    if not global_relevant_entries:
+        print("\n⚠️ 연구 관심사와 연관된 논문이 발견되지 않았습니다. 봇을 종료합니다.")
+        return
+
+    # 3단계: 걸러진 논문들에 대해 상세 평가 (최대 10개만 진행하여 API 고갈 방지)
     print(f"\n=====================================")
-    print(f"🤖 총 {len(global_relevant_entries)}개의 연관 논문에 대해 심층 평가를 시작합니다...")
+    print(f"🤖 총 {len(global_relevant_entries)}개의 연관 논문이 발견되었습니다.")
+    eval_limit = 10
+    if len(global_relevant_entries) > eval_limit:
+        print(f"⚠️ API 한도 보호를 위해 상위 {eval_limit}개 논문만 상세 평가합니다.")
+        global_relevant_entries = global_relevant_entries[:eval_limit]
     
     scored_papers = []
 
@@ -168,76 +173,62 @@ def run_paper_bot():
         link = entry.link
         abstract = entry.description if hasattr(entry, 'description') else "초록 없음"
 
-        print(f"\n📄 평가 중: {title}")
+        print(f"\n📄 상세 평가 중: {title}")
 
         prompt = f"""
-        너는 면역학, 분자생물학 연구자를 위한 '매우 엄격한' 전문 학술 비서이자 리뷰어 수준의 전문가야.
-        내 목표는 매일 최고의 퀄리티를 가진 논문 3편만 엄선해서 뉴스레터로 읽는 것이야.
-        아래 논문의 제목과 초록을 읽고, 내 관심사({', '.join(USER_INTERESTS)})와의 연관성 및 학술적 파급력을 매우 깐깐하게 평가해줘.
-        특히 기존 연구와 차별화되는 참신함(Novelty)이나 학계에 미칠 영향(Impact)이 낮으면 가차없이 낮은 점수를 줘야해. (일반적인 논문은 4~6점, 정말 읽어볼 가치가 있는 뛰어난 논문만 7점 이상을 줘).
+        너는 면역학, 분자생물학 전문가야. 아래 논문이 내 관심사({', '.join(USER_INTERESTS)})와 얼마나 밀접한지, 그리고 학술적 파급력이 어느 정도인지 평가해줘.
+        7점 이상은 정말 중요한 논문, 4~6점은 일반적인 논문으로 평가해.
 
         논문 제목: {title}
         초록: {abstract}
 
         반드시 아래 양식에 맞춰서 답변해.
         [점수] (1부터 10까지 숫자만)
-        [한줄요약] (이 논문을 꼭 읽어야 하는 이유를 포함하여 한국어로 1~2문장 요약)
-        [상세분석] 1. 핵심 발견과 참신성 (Key Findings & Novelty)
-        2. 연구의 파급력 (Significance & Impact)
-        3. 실험 방법론의 특이점 (Methods)
-        4. 한계점 (Limitations)
-        이 4가지 카테고리를 활용해 뉴스레터처럼 읽기 쉽고 흥미롭게, 하지만 전문성을 잃지 않고 500자 이내로 요약해줘. 기존에 없던 관점이나 훌륭한 발견은 이모지나 시각적으로 돋보이게 강조해줘.
+        [한줄요약] (한국어로 1~2문장 요약)
+        [상세분석] (핵심 발견, 파급력, 방법론, 한계점을 포함하여 500자 이내 한국어 요약)
         """
 
-        try:
-            # 평가 완료 후 바로 평가 목록 파일에 저장합니다. (점수와 무관하게 더 이상 검토하지 않도록)
-            with open(history_file, "a", encoding="utf-8") as f:
-                f.write(link + "\n")
-            evaluated_links.add(link)
+        # 상세 평가 전에 미리 history에 추가 (실패하더라도 다시 평가하지 않도록)
+        with open(history_file, "a", encoding="utf-8") as f:
+            f.write(link + "\n")
+        evaluated_links.add(link)
 
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    response = client.models.generate_content(
-                        model='gemini-2.5-flash',
-                        contents=prompt
-                    )
-                    result_text = response.text
-
-                    if "[점수]" in result_text and "[한줄요약]" in result_text:
-                        score_str = result_text.split("[점수]")[1].split("[한줄요약]")[0].strip()
-                        score = int(score_str)
-                        short_summary = result_text.split("[한줄요약]")[1].split("[상세분석]")[0].strip()
-                        detail_summary = result_text.split("[상세분석]")[1].strip()
-
-                        print(f"⭐ AI 평가 점수: {score} / 10점")
-                        
-                        scored_papers.append({
-                            "score": score,
-                            "title": title,
-                            "link": link,
-                            "short_summary": short_summary,
-                            "detail_summary": detail_summary
-                        })
-                    else:
-                        print("⚠️ AI가 정해진 양식대로 답변하지 않았습니다.")
-                    break # 성공시 반복문 탈출
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model=MODEL_NAME,
+                    contents=prompt
+                )
+                time.sleep(30) # 평가 간 30초 간격 유지 (RPM 안전 확보)
                 
-                except Exception as api_err:
-                    if "429" in str(api_err):
-                        print(f"   [디버깅용 원본 에러 출력]: {api_err}")
-                        print(f"   ⏳ API 분당 한도 초과(429). 65초 대기 후 재시도합니다... ({attempt+1}/{max_retries})")
-                        time.sleep(65)
-                    else:
-                        print(f"   ⚠️ 에러 발생: {api_err}")
-                        break
+                result_text = response.text
+                if "[점수]" in result_text and "[한줄요약]" in result_text:
+                    score_str = result_text.split("[점수]")[1].split("[한줄요약]")[0].strip()
+                    score = int(re.findall(r'\d+', score_str)[0])
+                    short_summary = result_text.split("[한줄요약]")[1].split("[상세분석]")[0].strip()
+                    detail_summary = result_text.split("[상세분석]")[1].strip()
 
-        except Exception as e:
-            print(f"⚠️ 에러 발생: {e}")
-        
-        time.sleep(20) # 논문 심사 간 20초 간격으로 분당 3회 요청만 하도록 제한 
+                    print(f"⭐ AI 평가 점수: {score} / 10점")
+                    scored_papers.append({
+                        "score": score,
+                        "title": title,
+                        "link": link,
+                        "short_summary": short_summary,
+                        "detail_summary": detail_summary
+                    })
+                else:
+                    print("⚠️ AI 응답 양식 불일치")
+                break
+            except Exception as api_err:
+                if "429" in str(api_err):
+                    print(f"   ⏳ API 한도 초과(429). 70초 대기 후 재시도합니다... ({attempt+1}/{max_retries})")
+                    time.sleep(70)
+                else:
+                    print(f"   ⚠️ 에러 발생: {api_err}")
+                    break
 
-    # 3단계: 점수 순으로 정렬 후 최상위 3개 논문만 선별하여 노션 업로드
+    # 4단계: 결과 정렬 및 노션 업로드
     if not scored_papers:
         print("\n⚠️ 최종적으로 정상 평가된 논문이 없습니다.")
         return
@@ -246,8 +237,7 @@ def run_paper_bot():
     top_3_papers = scored_papers[:3]
 
     print(f"\n=====================================")
-    print(f"🏆 전체 저널에서 가장 높은 점수를 받은 Top {len(top_3_papers)} 논문을 선별했습니다!")
-    print("노션에 저장을 시작합니다...")
+    print(f"🏆 Top {len(top_3_papers)} 논문 노션 저장을 시작합니다...")
 
     today = datetime.now().strftime("%Y-%m-%d")
 
