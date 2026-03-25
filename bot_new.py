@@ -50,8 +50,8 @@ USER_INTERESTS = [
 # ==========================================
 # ⚙️ 4. AI 및 노션 세팅
 # ==========================================
-# 모델명은 안정적인 서비스를 위해 gemini-1.5-flash를 기본으로 사용합니다.
-MODEL_NAME = "gemini-1.5-flash"
+# 모델명은 안정적인 서비스를 위해 기존 이 기기에서 동작이 확인된 gemini-2.5-flash를 사용합니다.
+MODEL_NAME = "gemini-2.5-flash"
 client = genai.Client(api_key=GEMINI_API_KEY)
 notion = Client(auth=NOTION_TOKEN)
 
