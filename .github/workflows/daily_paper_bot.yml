@@ -1,8 +1,5 @@
 name: Daily Paper Bot
 on:
-  push:
-    branches:
-      - main
   schedule:
     # 한국시간 아침 9시 20분 (00:20 UTC) - 부하 분산을 위해 20분으로 조정
     - cron: '20 0 * * *'
@@ -16,10 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
@@ -30,7 +27,6 @@ jobs:
 
       - name: Run Paper Bot
         env:
-          # 환경변수로 시크릿 키들을 봇 파일에 전달합니다
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -40,6 +36,5 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add evaluated_papers.txt
-          git commit -m "Update evaluated papers history [skip ci]" || echo "No changes to commit"
-          git push
+          git add -A
+          git diff --staged --quiet || (git commit -m "Update evaluated papers history [skip ci]" && git push)
