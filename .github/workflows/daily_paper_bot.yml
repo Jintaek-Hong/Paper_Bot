@@ -36,5 +36,11 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git diff --staged --quiet || (git commit -m "Update evaluated papers history [skip ci]" && git push)
+          git add evaluated_papers.txt 2>/dev/null || true
+          if ! git diff --staged --quiet 2>/dev/null; then
+            git commit -m "Update evaluated papers history [skip ci]"
+            git push
+            echo "✅ 변경사항을 커밋하고 push 했습니다."
+          else
+            echo "ℹ️ 커밋할 변경사항이 없습니다. 건너뜁니다."
+          fi
