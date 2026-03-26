@@ -50,12 +50,45 @@ USER_INTERESTS = [
 # ==========================================
 # ⚙️ 4. AI 및 노션 세팅
 # ==========================================
-MODEL_NAME = "gemini-2.5-flash"
+# 모델 우선순위 리스트: 첫 번째 모델이 429 에러 시 다음 모델로 자동 전환
+MODEL_PRIORITY = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+]
 client = genai.Client(api_key=GEMINI_API_KEY)
 notion = Client(auth=NOTION_TOKEN)
 
 # ==========================================
-# 🔑 5. 로컬 키워드 사전 필터링 (API 호출 제로)
+# 🤖 5. 안전한 AI 호출 함수 (폴백 + 지수 백오프)
+# ==========================================
+def safe_generate(prompt, max_retries=3):
+    """여러 모델을 순회하며 API 호출. 429 에러 시 다음 모델로 폴백."""
+    for model_name in MODEL_PRIORITY:
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+                return response.text, model_name
+            except Exception as api_err:
+                err_str = str(api_err)
+                if "429" in err_str:
+                    wait_time = 60 * (2 ** attempt)  # 60초, 120초, 240초
+                    print(f"   ⏳ [{model_name}] API 한도 초과(429). {wait_time}초 대기... ({attempt+1}/{max_retries})")
+                    time.sleep(wait_time)
+                elif "404" in err_str or "not found" in err_str.lower():
+                    print(f"   ⚠️ [{model_name}] 모델을 찾을 수 없음. 다음 모델로 전환...")
+                    break  # 이 모델 건너뛰고 다음 모델로
+                else:
+                    print(f"   ⚠️ [{model_name}] API 에러: {api_err}")
+                    break
+        print(f"   🔄 [{model_name}] 실패. 다음 모델로 전환 시도...")
+    return None, None
+
+# ==========================================
+# 🔑 6. 로컬 키워드 사전 필터링 (API 호출 제로)
 # ==========================================
 def keyword_prefilter(title, abstract):
     """제목과 초록에서 관심 키워드가 하나라도 있으면 True 반환"""
@@ -140,28 +173,20 @@ def run_paper_bot():
     batch_prompt = "\n".join(prompt_lines)
     
     relevant_entries = []
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            filter_response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=batch_prompt
-            )
-            resp_text = filter_response.text.strip()
-            if "없음" not in resp_text:
-                indices = [int(num) for num in re.findall(r'\d+', resp_text)]
-                for idx in sorted(list(set(indices))):
-                    if 0 <= idx < len(keyword_matched):
-                        relevant_entries.append(keyword_matched[idx])
-            print(f"   ✅ AI 필터링 완료: {len(relevant_entries)}개 연관 논문 발견")
-            break
-        except Exception as api_err:
-            if "429" in str(api_err):
-                print(f"   ⏳ API 한도 초과(429). 70초 대기 후 재시도... ({attempt+1}/{max_retries})")
-                time.sleep(70)
-            else:
-                print(f"   ⚠️ AI 필터링 에러: {api_err}")
-                break
+    resp_text, used_model = safe_generate(batch_prompt)
+    if resp_text:
+        resp_text = resp_text.strip()
+        if "없음" not in resp_text:
+            indices = [int(num) for num in re.findall(r'\d+', resp_text)]
+            for idx in sorted(list(set(indices))):
+                if 0 <= idx < len(keyword_matched):
+                    relevant_entries.append(keyword_matched[idx])
+        print(f"   ✅ AI 필터링 완료 (모델: {used_model}): {len(relevant_entries)}개 연관 논문 발견")
+    else:
+        print(f"   ❌ 모든 모델에서 API 호출 실패. AI 필터링을 건너뜁니다.")
+        # AI 필터링 실패 시, 키워드 매칭 결과를 그대로 사용 (상위 5개)
+        relevant_entries = keyword_matched[:5]
+        print(f"   ↩️ 키워드 매칭 상위 {len(relevant_entries)}개를 직접 평가 대상으로 사용합니다.")
 
     if not relevant_entries:
         print("\n⚠️ AI 필터링 결과 연관 논문이 없습니다. 봇을 종료합니다.")
@@ -174,6 +199,10 @@ def run_paper_bot():
     # 상세 평가 대상은 최대 5개로 제한
     if len(relevant_entries) > 5:
         relevant_entries = relevant_entries[:5]
+
+    # 1단계와 2단계 사이 API 호출 간격 확보
+    print("   ⏸️ API 호출 간격 확보를 위해 10초 대기...")
+    time.sleep(10)
 
     # ===== 3단계: AI 일괄 상세 평가 (API 호출 1회) =====
     print(f"\n🤖 [AI 호출 2/2] {len(relevant_entries)}개 논문 일괄 상세 평가 중...")
@@ -197,59 +226,46 @@ def run_paper_bot():
     eval_prompt = "\n".join(eval_prompt_lines)
     
     scored_papers = []
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=eval_prompt
-            )
-            result_text = response.text
-            
-            # 각 논문별 결과 파싱
-            for idx, entry in enumerate(relevant_entries):
-                try:
-                    # 해당 논문의 평가 섹션 추출
-                    marker = f"===논문[{idx}]==="
-                    next_marker = f"===논문[{idx+1}]==="
+    result_text, used_model = safe_generate(eval_prompt)
+    if result_text:
+        # 각 논문별 결과 파싱
+        for idx, entry in enumerate(relevant_entries):
+            try:
+                marker = f"===논문[{idx}]==="
+                next_marker = f"===논문[{idx+1}]==="
+                
+                if marker in result_text:
+                    if next_marker in result_text:
+                        section = result_text.split(marker)[1].split(next_marker)[0]
+                    else:
+                        section = result_text.split(marker)[1]
                     
-                    if marker in result_text:
-                        if next_marker in result_text:
-                            section = result_text.split(marker)[1].split(next_marker)[0]
-                        else:
-                            section = result_text.split(marker)[1]
+                    if "[점수]" in section and "[한줄요약]" in section:
+                        score_str = section.split("[점수]")[1].split("[한줄요약]")[0].strip()
+                        score = int(re.findall(r'\d+', score_str)[0])
                         
-                        if "[점수]" in section and "[한줄요약]" in section:
-                            score_str = section.split("[점수]")[1].split("[한줄요약]")[0].strip()
-                            score = int(re.findall(r'\d+', score_str)[0])
-                            
-                            short_summary = section.split("[한줄요약]")[1]
-                            if "[상세분석]" in short_summary:
-                                detail_summary = short_summary.split("[상세분석]")[1].strip()
-                                short_summary = short_summary.split("[상세분석]")[0].strip()
-                            else:
-                                detail_summary = "상세 분석 없음"
-                                short_summary = short_summary.strip()
-                            
-                            print(f"   ⭐ [{idx}] {entry.title[:50]}... → {score}점")
-                            scored_papers.append({
-                                "score": score,
-                                "title": entry.title,
-                                "link": entry.link,
-                                "short_summary": short_summary,
-                                "detail_summary": detail_summary
-                            })
-                except Exception as parse_err:
-                    print(f"   ⚠️ 논문[{idx}] 파싱 실패: {parse_err}")
-            
-            print(f"   ✅ 일괄 평가 완료: {len(scored_papers)}개 정상 평가됨")
-            break
-        except Exception as api_err:
-            if "429" in str(api_err):
-                print(f"   ⏳ API 한도 초과(429). 70초 대기 후 재시도... ({attempt+1}/{max_retries})")
-                time.sleep(70)
-            else:
-                print(f"   ⚠️ 평가 에러: {api_err}")
-                break
+                        short_summary = section.split("[한줄요약]")[1]
+                        if "[상세분석]" in short_summary:
+                            detail_summary = short_summary.split("[상세분석]")[1].strip()
+                            short_summary = short_summary.split("[상세분석]")[0].strip()
+                        else:
+                            detail_summary = "상세 분석 없음"
+                            short_summary = short_summary.strip()
+                        
+                        print(f"   ⭐ [{idx}] {entry.title[:50]}... → {score}점")
+                        scored_papers.append({
+                            "score": score,
+                            "title": entry.title,
+                            "link": entry.link,
+                            "short_summary": short_summary,
+                            "detail_summary": detail_summary
+                        })
+            except Exception as parse_err:
+                print(f"   ⚠️ 논문[{idx}] 파싱 실패: {parse_err}")
+        
+        print(f"   ✅ 일괄 평가 완료 (모델: {used_model}): {len(scored_papers)}개 정상 평가됨")
+    else:
+        print(f"   ❌ 모든 모델에서 상세 평가 실패.")
 
     # 평가한 논문들을 히스토리에 기록
     with open(history_file, "a", encoding="utf-8") as f:
